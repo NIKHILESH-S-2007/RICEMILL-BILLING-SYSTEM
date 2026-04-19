@@ -1,0 +1,115 @@
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.concurrent.*;
+
+public class RepeatedRequester {
+
+    private final ScheduledExecutorService scheduler;
+    private final HttpClient httpClient;
+    private final URI targetUri;
+    private final long initialDelaySeconds;
+    private final long periodSeconds;
+    private final AtomicInteger counter = new AtomicInteger(0);
+    private ScheduledFuture<?> scheduledFuture;
+
+    // If you want to stop after N calls - set to <=0 for unlimited (use with caution).
+    private final int maxCalls;
+
+    public RepeatedRequester(String targetUrl, long initialDelaySeconds, long periodSeconds, int maxCalls) {
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "repeated-requester");
+            t.setDaemon(false);
+            return t;
+        });
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+        this.targetUri = URI.create(targetUrl);
+        this.initialDelaySeconds = initialDelaySeconds;
+        this.periodSeconds = periodSeconds;
+        this.maxCalls = maxCalls;
+    }
+
+    public void start() {
+        if (scheduledFuture != null && !scheduledFuture.isDone()) {
+            System.out.println("Already running.");
+            return;
+        }
+
+        Runnable task = () -> {
+            try {
+                int callIndex = counter.incrementAndGet();
+
+                // Stop condition if maxCalls > 0
+                if (maxCalls > 0 && callIndex > maxCalls) {
+                    System.out.println("Reached max calls (" + maxCalls + "). Stopping.");
+                    stop();
+                    return;
+                }
+
+                // Build request (example POST with JSON body). Replace with a safe test endpoint.
+                String jsonBody = "{\"ping\": " + callIndex + "}";
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(targetUri)
+                        .timeout(Duration.ofSeconds(10))
+                        .header("Content-Type", "application/json")
+                        .header("User-Agent", "RepeatedRequester/1.0")
+                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                        .build();
+
+                // Send synchronously (alternatively use sendAsync)
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                System.out.printf("Call #%d -> %d %s%n", callIndex, response.statusCode(),
+                        response.body() == null ? "" : response.body().substring(0, Math.min(200, response.body().length())));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                System.out.println("Task interrupted. Stopping.");
+                stop();
+            } catch (Exception e) {
+                // Log and continue; consider backoff if repeated failures happen.
+                System.err.println("Request failed: " + e.getClass().getSimpleName() + " - " + e.getMessage());
+            }
+        };
+
+        scheduledFuture = scheduler.scheduleAtFixedRate(task, initialDelaySeconds, periodSeconds, TimeUnit.SECONDS);
+        System.out.println("Started scheduler: every " + periodSeconds + "s");
+    }
+
+    public void stop() {
+        if (scheduledFuture != null) {
+            scheduledFuture.cancel(false);
+        }
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        System.out.println("Scheduler stopped.");
+    }
+
+    public int getCallCount() {
+        return counter.get();
+    }
+
+    public static void main(String[] args) {
+        // Example usage:
+        // IMPORTANT: set targetUrl to a test server you own or have permission to call.
+        String targetUrl = "https://example.test/health"; // <-- replace with your test endpoint
+        RepeatedRequester requester = new RepeatedRequester(targetUrl, 0, 1, 0); // 0 for maxCalls = unlimited
+        requester.start();
+
+        // Example: run for 30 seconds then stop (safe demo)
+        Executors.newSingleThreadScheduledExecutor().schedule(() -> {
+            System.out.println("Demo period over, stopping...");
+            requester.stop();
+            System.exit(0);
+        }, 30, TimeUnit.SECONDS);
+    }
+}
